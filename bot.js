@@ -190,36 +190,49 @@ async function generateAndSend(userId, state) {
 // ── Gemini 圖片生成 ──────────────────────────────────────
 async function geminiGenerateImage(pikminBuf, selfieBuf) {
   const genAI = new GoogleGenerativeAI(getGemini());
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash-exp',
-    generationConfig: { responseModalities: ['Text', 'Image'] },
-  });
 
-  const result = await model.generateContent([
-    {
-      text: `Two images provided:
+  // 依序嘗試 Google 目前可用的支援圖片輸出模型
+  const MODELS = [
+    'gemini-2.0-flash-preview-image-generation',
+    'gemini-2.0-flash-exp-image-generation',
+  ];
+
+  const prompt = `Two images provided:
 Image 1: Pikmin game screenshot with Pikmin characters.
 Image 2: Person's selfie.
-
 Create a composite photo:
 - Keep the person exactly as-is from the selfie
 - Naturally place Pikmin characters around the person (shoulder, hand, ground)
 - Realistic lighting, seamless blending, NOT a collage
-- Warm cheerful atmosphere like a real photo`,
-    },
-    { inlineData: { data: pikminBuf.toString('base64'), mimeType: 'image/jpeg' } },
-    { inlineData: { data: selfieBuf.toString('base64'), mimeType: 'image/jpeg' } },
-  ]);
+- Warm cheerful atmosphere like a real photo`;
 
-  const parts =
-    result.response.candidates?.[0]?.content?.parts || [];
-
-  for (const part of parts) {
-    if (part.inlineData?.mimeType?.startsWith('image/')) {
-      return part.inlineData.data; // base64
+  let lastErr = null;
+  for (const modelName of MODELS) {
+    try {
+      console.log('[GEMINI] 嘗試模型: ' + modelName);
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: { responseModalities: ['Text', 'Image'] },
+      });
+      const result = await model.generateContent([
+        { text: prompt },
+        { inlineData: { data: pikminBuf.toString('base64'), mimeType: 'image/jpeg' } },
+        { inlineData: { data: selfieBuf.toString('base64'), mimeType: 'image/jpeg' } },
+      ]);
+      const parts = result.response.candidates?.[0]?.content?.parts || [];
+      for (const part of parts) {
+        if (part.inlineData?.mimeType?.startsWith('image/')) {
+          console.log('[GEMINI] 成功！模型=' + modelName);
+          return part.inlineData.data;
+        }
+      }
+      throw new Error('模型未回傳圖片');
+    } catch (err) {
+      console.warn('[GEMINI] ' + modelName + ' 失敗: ' + err.message);
+      lastErr = err;
     }
   }
-  throw new Error('Gemini 未回傳圖片');
+  throw lastErr || new Error('所有 Gemini 模型均失敗');
 }
 
 // ── Sharp 本地合成 Fallback ───────────────────────────────
