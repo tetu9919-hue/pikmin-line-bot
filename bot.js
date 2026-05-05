@@ -176,33 +176,50 @@ async function geminiGenerateImage(pikBuf, selfBuf) {
 
 ━━━ STRICT RULES ━━━
 
-【PEOPLE in IMAGE 2】
-• Every person must remain EXACTLY as-is: face, clothes, body, position, expression
-• Do NOT move, resize, crop, or alter any person
-• The background scene from IMAGE 2 must be preserved completely
+【Task Objective】
+Perform a high-fidelity image composition task. Naturally integrate specific characters from a source image into a real-world target scene. The final output must appear as a single, cohesive photograph taken in the same time and space.
 
-【PIKMIN CHARACTERS from IMAGE 1】
-• Identify each distinct Pikmin character in IMAGE 1 (by color: red, blue, yellow, etc.)
-• Use ONLY the exact Pikmin types visible in IMAGE 1 — do NOT invent new ones
-• REMOVE all game backgrounds, UI elements, sky, ground textures from IMAGE 1
-• Extract each Pikmin as a standalone character with TRANSPARENT background
+【Input Data】
 
-【HOW TO PLACE PIKMIN — copy this style】
-Think of the result like a real AR photo where Pikmin physically exist in the scene:
-• Place 1 Pikmin jumping or climbing UP along someone's raised arm or hand (like riding the arm)
-• Place 1–2 Pikmin standing on the ground beside/between the people, at ankle-to-knee height
-• Place 1 Pikmin peeking from behind someone's shoulder or bag
-• Optional: 1 small Pikmin sitting on top of someone's head or hat
-• Pikmin should appear at DIFFERENT depths (some closer = larger, some farther = smaller)
-• Pikmin near the camera foreground should be 15–20% of frame height
-• Pikmin in mid-ground should be 10–13% of frame height
+Target Scene (Primary): A real-life photograph containing people and a complex environment (e.g., train station, street, landscape).
 
-【REALISM & BLENDING】
-• Pikmin must cast soft ground shadows matching the scene's light direction
-• Match color temperature: if photo is warm/cool, tint Pikmin accordingly
-• Pikmin edges must be soft and anti-aliased — zero hard cutout edges
-• Result must look like a real smartphone AR photo, NOT a collage
-• Preserve the full aspect ratio and resolution of IMAGE 2`;
+Character Source: An image containing one or more virtual characters (e.g., Pikmin).
+
+【Execution Steps & Principles】
+
+1. Scene Analysis (Target Image):
+
+Precisely identify the primary subjects (people), foreground, mid-ground (e.g., tracks, platform), and background elements (e.g., trains, trees, distant structures).
+
+Analyze the ambient lighting (direction, color temperature, intensity) and Depth of Field (DoF) to determine which areas are sharp or blurred.
+
+2. Character Extraction (Source Image):
+
+Core Directive: Perform high-precision background removal (de-masking). Characters (including stems, leaves, and flowers) must be completely isolated from their original background.
+
+Ensure zero background artifacts or "halos" remain around the character edges.
+
+3. Integration & Layout Strategy:
+
+Subject Primacy: The people in the target photo must remain the focal point. They must not be obscured, cropped, or resized.
+
+Logical Placement: Position the extracted characters in logical locations within the 3D space (e.g., standing on tracks, perched on a platform edge, or near the subjects).
+
+Dynamic Variety: If multiple characters are provided, distribute them throughout the scene to enhance liveliness and interaction.
+
+Perspective & Scaling: Adjust character size based on their placement. Characters closer to the camera must be larger, while those further away must be smaller, strictly adhering to linear perspective.
+
+4. Advanced Environmental Adaptation (Post-Processing):
+
+Lighting & Shadow: Re-calculate and apply the target scene's light source to the characters. Apply soft contact shadows beneath characters where they touch surfaces.
+
+Color Grading: Adjust the characters' saturation and color temperature to match the overall mood of the target photo (e.g., warm afternoon sun or cool overcast tones).
+
+Depth of Field (DoF) Matching: Apply appropriate Gaussian blur to characters placed in the background or extreme foreground to match the lens focus of the original photo.
+
+5. Final Output:
+
+Generate a high-resolution composite image. Ensure the original human subjects remain crisp, character edges are clean and naturally blended, and the overall composition is visually convincing and realistic.
 
   let lastErr = null;
   for (const modelName of MODELS) {
