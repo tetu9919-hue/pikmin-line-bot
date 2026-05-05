@@ -186,58 +186,133 @@ async function analyzeCharacters(userId, state) {
   console.log('[ANALYZE] 開始角色特徵分析...');
 
   const genAI = new GoogleGenerativeAI(getGemini());
-  // 分析用純文字模型即可，不需要圖片輸出
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
-  const analyzePrompt = `請對這張圖片中的虛擬角色進行深度特徵解構，作為後續 AR 合照生成任務的依據。
+  // ── 分析用模型：依序 fallback，找到第一個可用的 ──────────
+  // gemini-2.0-flash 支援圖片輸入（multimodal vision）
+  const ANALYZE_MODELS = [
+    'gemini-2.0-flash',           // 最新穩定版（支援 vision）
+    'gemini-2.0-flash-lite',      // 輕量備用
+    'gemini-1.5-flash',           // 舊版備用
+    'gemini-1.5-flash-latest',    // 舊版最新
+  ];
 
-請以結構化方式提供以下資訊（使用英文回答，以便後續 AI 生成使用）：
+  const analyzePrompt = `You are an expert visual analyst specializing in 3D character recognition.
+Analyze this game screenshot and perform a deep character deconstruction.
+This analysis will be used as the definitive reference for natively re-rendering these characters in a real photograph via AR compositing.
 
-1. CHARACTER LIST: List all unique character types with their exact colors.
+Provide a structured report in English with these exact sections:
 
-2. ANATOMICAL FEATURES: For each character, describe in detail:
-   - Body shape and proportions
-   - Eye shape, size, and color
-   - Head decorations (leaves, flowers, antennae, etc.) — describe size, color, texture
-   - Ear shape or limb features
-   - Mouth or facial expression characteristics
+═══════════════════════════════════════
+SECTION 1 — CHARACTER INVENTORY
+═══════════════════════════════════════
+List every distinct character type visible in this image.
+For each: [Type Name] | [Primary Color] | [Count visible]
+Example: Red Pikmin | Vivid red-orange body | 2 visible
 
-3. MATERIAL & TEXTURE: Describe the surface quality of each character:
-   - Is it matte, glossy, rubbery, plant-fiber-like, or other?
-   - Any special effects (glow, translucency, etc.)?
-   - Describe the 3D rendering style (e.g., smooth plastic-like, organic, cartoon)
+═══════════════════════════════════════
+SECTION 2 — ANATOMICAL FEATURES (per character)
+═══════════════════════════════════════
+For EACH character type found, describe:
+• BODY: Shape (round, elongated, etc.), size proportions, limb count and shape
+• EYES: Shape (circular, oval, googly), size relative to head, color, any pupils
+• HEAD DECORATION: Type (leaf/flower/bud/rock/none), exact color, size, texture, attachment point
+• EARS/PROTRUSIONS: Shape, size, position on head
+• MOUTH: Presence, shape, expression
+• SPECIAL FEATURES: Any unique markings, patterns, or distinguishing traits
 
-4. SCALE REFERENCE: Describe the characters' proportions relative to humans:
-   - Approximate height compared to a human (e.g., ankle height, knee height, hand-sized)
-   - Relative size between different characters (if multiple exist)
+═══════════════════════════════════════
+SECTION 3 — MATERIAL & SURFACE QUALITY
+═══════════════════════════════════════
+For each character:
+• Surface finish: (matte rubber / glossy plastic / soft organic / translucent / etc.)
+• 3D render style: (smooth cartoon / realistic organic / toy-like / etc.)
+• Lighting response: (does it appear to absorb light softly or reflect sharply?)
+• Texture details: (smooth, bumpy, plant-fiber, etc.)
 
-5. UNIQUE IDENTIFIERS: List any distinctive features that must be preserved exactly
-   (e.g., the exact shade of the flower, the specific shape of the leaf, ear proportions)
+═══════════════════════════════════════
+SECTION 4 — SCALE & PROPORTIONS
+═══════════════════════════════════════
+• Estimated height relative to an adult human: (e.g., "reaches ankle", "palm-sized", "knee height")
+• Head-to-body ratio: (e.g., "head is 40% of total height")
+• Relative sizes between different character types in this image
 
-Be precise and detailed — this analysis will be used to natively re-render these characters in a real photograph.`;
+═══════════════════════════════════════
+SECTION 5 — CRITICAL PRESERVATION RULES
+═══════════════════════════════════════
+List the NON-NEGOTIABLE features that must be reproduced exactly:
+• Exact color codes or descriptions for each character
+• Specific decorations that define each character type
+• Any pose or expression that is characteristic
+• Features that distinguish this character from similar ones
 
-  const pikBuf = await resizeImage(state.pikmin, 1024);
+Be extremely precise — this is used for photorealistic AR generation.`;
 
-  const result = await model.generateContent([
-    { text: analyzePrompt },
-    { inlineData: { data: pikBuf.toString('base64'), mimeType: 'image/jpeg' } },
-  ]);
+  const pikBuf = await resizeImage(state.pikmin, 1280); // 高解析度提升分析精度
+  let profile = '';
+  let usedModel = '';
+  let lastErr = null;
 
-  const profile = result.response.text();
+  for (const modelName of ANALYZE_MODELS) {
+    try {
+      console.log('[ANALYZE] 嘗試模型: ' + modelName);
+      const model = genAI.getGenerativeModel({ model: modelName });
+
+      const result = await model.generateContent([
+        { text: analyzePrompt },
+        { inlineData: { data: pikBuf.toString('base64'), mimeType: 'image/jpeg' } },
+      ]);
+
+      // 安全讀取 response
+      const candidate = result.response.candidates?.[0];
+      if (!candidate) throw new Error('response.candidates 為空');
+
+      const parts = candidate.content?.parts || [];
+      const textPart = parts.find(p => p.text);
+      if (!textPart || !textPart.text) throw new Error('response 無文字內容');
+
+      profile = textPart.text.trim();
+      if (profile.length < 100) throw new Error('回傳內容過短: ' + profile.length + ' chars');
+
+      usedModel = modelName;
+      console.log('[ANALYZE] ✅ 成功! 模型=' + modelName + ' 長度=' + profile.length);
+      break; // 成功，跳出迴圈
+
+    } catch (err) {
+      const errDetail = err.status ? ('HTTP ' + err.status + ' ') : '';
+      console.error('[ANALYZE] ❌ ' + modelName + ' 失敗: ' + errDetail + err.message);
+      lastErr = err;
+    }
+  }
+
+  // 所有模型都失敗
+  if (!profile) {
+    const errMsg = lastErr ? lastErr.message : '未知錯誤';
+    console.error('[ANALYZE] 所有模型均失敗，最後錯誤: ' + errMsg);
+    throw new Error('角色分析失敗: ' + errMsg);
+  }
+
+  // ── 儲存分析結果 ──────────────────────────────────────
   state.characterProfile = profile;
   state.step = 'wait_selfie';
 
-  console.log('[ANALYZE] 分析完成，特徵描述長度:', profile.length);
-  console.log('[ANALYZE] 摘要:\n' + profile.slice(0, 300) + '...');
+  console.log('[ANALYZE] 分析完成，使用模型: ' + usedModel);
+  console.log('[ANALYZE] 摘要 (前500字):\n' + profile.slice(0, 500));
 
-  // 解析角色數量（讓使用者知道 AI 看懂了幾隻）
-  const characterCount = (profile.match(/\d+\.\s*(Red|Blue|Yellow|Green|Purple|White|Rock|Winged|Bulbmin)/gi) || []).length;
-  const countText = characterCount > 0 ? characterCount + ' 種角色' : '角色特徵';
+  // ── 解析角色清單，顯示給使用者 ───────────────────────
+  // 從 SECTION 1 提取角色名稱
+  const charMatches = profile.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+Pikmin|[A-Z][a-z]+ Pikmin)/g) || [];
+  const uniqueChars = [...new Set(charMatches)];
+
+  let charListText = '';
+  if (uniqueChars.length > 0) {
+    charListText = '\n🎨 辨識到的角色：\n' + uniqueChars.map(c => '   • ' + c).join('\n');
+  }
 
   await pushMsg(userId,
-    '✅ 角色特徵解析完成！\n' +
-    '🔬 AI 已辨識出 ' + countText + '\n\n' +
-    '📸 現在請傳送你的照片～\n（自拍、人像、多人合照皆可）');
+    '✅ 角色特徵深度解析完成！\n' +
+    '🔬 分析了 ' + profile.length + ' 字的特徵資料' +
+    charListText +
+    '\n\n📸 現在請傳送你的照片～\n（自拍、人像、多人合照皆可）');
 }
 
 // ══════════════════════════════════════════════════════════════
