@@ -159,7 +159,7 @@ async function generateAndSend(userId, state) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ── Gemini 生成（v7 精準 prompt，對標 Image2）────────────
+// ── Gemini 生成（v8：完整 AR 合照 prompt）────────────────
 // ═══════════════════════════════════════════════════════════
 async function geminiGenerateImage(pikBuf, selfBuf) {
   const genAI = new GoogleGenerativeAI(getGemini());
@@ -168,58 +168,96 @@ async function geminiGenerateImage(pikBuf, selfBuf) {
     'gemini-2.0-flash-exp-image-generation',
   ];
 
-  // ▼▼▼ 針對 Image2 效果精準設計的 prompt ▼▼▼
-  const prompt = `You will receive TWO images. Your job is to create ONE final composite photo.
+  // ─────────────────────────────────────────────────────────
+  // 完整高精度 AR 合照 prompt
+  // image_0 = 人物照片（第一張傳入）
+  // image_1 = 皮克敏截圖（第二張傳入）
+  // ─────────────────────────────────────────────────────────
+  const prompt = `This is a high-fidelity image composition task. \
+The goal is to create a seamless, believable augmented reality (AR) photograph, \
+placing the virtual Pikmin characters from image_1 into the real-world scene from image_0, \
+making them look like physical entities within that environment.
 
-=== IMAGE 1 === Pikmin characters source (game screenshot)
-=== IMAGE 2 === Real photo with people (THE MAIN PHOTO — keep everything intact)
+=== image_0 = REAL-WORLD PHOTO (the main photo — preserve EVERYTHING) ===
+=== image_1 = PIKMIN SOURCE (game screenshot — extract characters only) ===
 
-━━━ STRICT RULES ━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — THE REAL-WORLD FOUNDATION (image_0)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Preserve the ENTIRE photograph from image_0 without any alteration.
+• Every person in the photo must remain EXACTLY as-is:
+  their face, clothes, body, pose, expression, and screen position must be untouched.
+• CRITICAL INTERACTION POINTS that must not be moved or obscured:
+  - Any raised hand or peace sign gesture (key Pikmin interaction point)
+  - Any hands holding objects (boba tea cups, bags, etc.)
+• The background (train, tracks, trees, platform, other travelers) must be fully preserved.
 
-【Task Objective】
-Perform a high-fidelity image composition task. Naturally integrate specific characters from a source image into a real-world target scene. The final output must appear as a single, cohesive photograph taken in the same time and space.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — PIKMIN CHARACTER EXTRACTION (image_1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Identify ONLY the specific Pikmin types that exist in image_1.
+  Common types by color: Red Pikmin, Yellow Pikmin (large ears), Blue Pikmin (mouth), etc.
+• Use ONLY those exact types — do NOT invent or add any type not present in image_1.
+• Extract each Pikmin with a PIXEL-PERFECT transparent background.
+  Remove ALL: game backgrounds, buildings, sky, ground textures, UI elements.
+• Maintain each character\'s defining features exactly:
+  leaf size, ear size, flower details, color accuracy.
 
-【Input Data】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — PLACEMENT AND INTERACTION (AR Effect)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Place Pikmin logically into the 3D space. DO NOT place them in corners.
+Assign placements based on available Pikmin types:
 
-Target Scene (Primary): A real-life photograph containing people and a complex environment (e.g., train station, street, landscape).
+PLACEMENT A — "Riding the Arm" (highest priority interaction):
+  • Take one Pikmin and place it as if actively jumping or climbing up
+    along the raised arm or peace-sign hand of a person.
+  • Scale it as a small creature proportionally to the arm.
+  • It should appear to grip or balance on the wrist/forearm area.
 
-Character Source: An image containing one or more virtual characters (e.g., Pikmin).
+PLACEMENT B — "Near-Camera Foreground" (largest Pikmin):
+  • Place one Pikmin in the near foreground, standing on the ground
+    (rocks, gravel, platform edge) at the side or bottom of the frame.
+  • Due to closeness to the lens: scale it to 15–20% of the frame height.
+  • It should face toward the camera or look up at the people.
 
-【Execution Steps & Principles】
+PLACEMENT C — "Mid-ground Scene" (medium Pikmin):
+  • Place one Pikmin on the ground between or beside people in the mid-ground.
+  • Scale it to 10–13% of frame height, matching its depth.
+  • Position it naturally as if it wandered into the scene.
 
-1. Scene Analysis (Target Image):
+PLACEMENT D — "Peek-a-boo" (optional, if a 4th Pikmin or duplicate is needed):
+  • Place a small Pikmin peeking from behind an object a person is holding
+    (bag, cup, clothing fold) — making it look tiny and cautious.
+  • Scale: roughly 6–8% of frame height.
 
-Precisely identify the primary subjects (people), foreground, mid-ground (e.g., tracks, platform), and background elements (e.g., trains, trees, distant structures).
+DEPTH AND SCALE RULE (critical):
+  • Foreground Pikmin > Mid-ground Pikmin > Background Pikmin in size.
+  • Slight blur on mid/background Pikmin to match the photo\'s depth of field.
+  • The foreground Pikmin should be as sharp as the nearest person\'s face.
 
-Analyze the ambient lighting (direction, color temperature, intensity) and Depth of Field (DoF) to determine which areas are sharp or blurred.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — REALISM AND BLENDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHADOWS:
+  • Every Pikmin standing on a surface must cast a soft, realistic ground shadow.
+  • Shadow direction must match the natural light source in image_0.
+  • For Pikmin on arms/clothing: add a tiny soft contact shadow on the fabric.
 
-2. Character Extraction (Source Image):
+COLOR TEMPERATURE:
+  • Shift the Pikmin\'s color balance to match the ambient lighting of image_0.
+  • If the photo has warm natural daylight: warm up the Pikmin slightly.
+  • They must NOT look like saturated 3D assets copy-pasted in.
 
-Core Directive: Perform high-precision background removal (de-masking). Characters (including stems, leaves, and flowers) must be completely isolated from their original background.
+EDGE BLENDING:
+  • All Pikmin cutout edges must be perfectly anti-aliased and softened.
+  • Blend edges with the textures they are placed against (clothing, gravel, rock).
+  • Zero hard "scissor-cut" lines visible anywhere.
 
-Ensure zero background artifacts or "halos" remain around the character edges.
-
-3. Integration & Layout Strategy:
-
-Subject Primacy: The people in the target photo must remain the focal point. They must not be obscured, cropped, or resized.
-
-Logical Placement: Position the extracted characters in logical locations within the 3D space (e.g., standing on tracks, perched on a platform edge, or near the subjects).
-
-Dynamic Variety: If multiple characters are provided, distribute them throughout the scene to enhance liveliness and interaction.
-
-Perspective & Scaling: Adjust character size based on their placement. Characters closer to the camera must be larger, while those further away must be smaller, strictly adhering to linear perspective.
-
-4. Advanced Environmental Adaptation (Post-Processing):
-
-Lighting & Shadow: Re-calculate and apply the target scene's light source to the characters. Apply soft contact shadows beneath characters where they touch surfaces.
-
-Color Grading: Adjust the characters' saturation and color temperature to match the overall mood of the target photo (e.g., warm afternoon sun or cool overcast tones).
-
-Depth of Field (DoF) Matching: Apply appropriate Gaussian blur to characters placed in the background or extreme foreground to match the lens focus of the original photo.
-
-5. Final Output:
-
-Generate a high-resolution composite image. Ensure the original human subjects remain crisp, character edges are clean and naturally blended, and the overall composition is visually convincing and realistic.
+FINAL OUTPUT:
+  • Preserve the EXACT aspect ratio and resolution of image_0.
+  • The result must look like a real smartphone AR photo, not a digital collage.
+  • Overall atmosphere: warm, joyful, natural — as if the Pikmin truly live in this world.`;
 
   let lastErr = null;
   for (const modelName of MODELS) {
@@ -231,10 +269,10 @@ Generate a high-resolution composite image. Ensure the original human subjects r
       });
       const result = await model.generateContent([
         { text: prompt },
-        // IMAGE 1 先傳皮克敏截圖
-        { inlineData: { data: pikBuf.toString('base64'),  mimeType: 'image/jpeg' } },
-        // IMAGE 2 後傳人物照片
+        // image_0 = 人物照片（先傳，作為主體底圖）
         { inlineData: { data: selfBuf.toString('base64'), mimeType: 'image/jpeg' } },
+        // image_1 = 皮克敏截圖（後傳，提供角色素材）
+        { inlineData: { data: pikBuf.toString('base64'),  mimeType: 'image/jpeg' } },
       ]);
       const parts = result.response.candidates?.[0]?.content?.parts || [];
       for (const part of parts) {
@@ -251,7 +289,6 @@ Generate a high-resolution composite image. Ensure the original human subjects r
   }
   throw lastErr || new Error('所有模型均失敗');
 }
-
 // ═══════════════════════════════════════════════════════════
 // ── Sharp 合成 Fallback（v7：亮度去背 + 自然融合）────────
 // ═══════════════════════════════════════════════════════════
