@@ -1,11 +1,18 @@
 /**
- * 🌿 皮克敏合照 LINE Bot - v6
+ * 🌿 皮克敏合照 LINE Bot - v7
  *
- * 核心改進：
- * - sharpComposite 完全重寫：人物為主體，皮克敏隨機多點擺放（腳邊/肩/手）
- * - 皮克敏截圖切割分析：自動識別截圖中的角色區塊，分別縮放擺放
- * - Gemini prompt 強化：明確要求以人為主體、去背、只用截圖中出現的角色
- * - 所有 v3~v5 的修正全部保留
+ * 針對 Image1 vs Image2 對比分析的完整修正：
+ *
+ * 問題根因：
+ *   - 舊版 sharp 把「整張截圖（含遊戲背景框）」切成三塊直接貼上
+ *   - 結果是三個帶背景的小方框貼在角落，完全不像合照
+ *
+ * v7 解法：
+ *   1. Gemini prompt 完全重寫 → 精確描述「去背、融入、互動感、比例」
+ *      對標 Image2：皮克敏站在人旁邊、搭手、有花朵、大小自然
+ *   2. sharp fallback 改寫 → 用亮度差異去背（移除遊戲背景）再貼上
+ *      至少不會出現「帶背景方框」的問題
+ *   3. 生成完整流程不變（所有 v3~v6 的下載/上傳/retry 全保留）
  */
 
 const express = require('express');
@@ -24,9 +31,7 @@ function getGemini() { return process.env.GEMINI_API_KEY || ''; }
 const app = express();
 
 function getClient() {
-  return new line.messagingApi.MessagingApiClient({
-    channelAccessToken: getToken(),
-  });
+  return new line.messagingApi.MessagingApiClient({ channelAccessToken: getToken() });
 }
 
 // ── 使用者狀態 ────────────────────────────────────────────
@@ -40,15 +45,13 @@ function resetState(userId) {
 }
 
 // ── 健康檢查 ──────────────────────────────────────────────
-app.get('/', (req, res) => res.send('🌿 皮克敏合照 Bot v6 運作中！'));
+app.get('/', (req, res) => res.send('🌿 皮克敏合照 Bot v7 運作中！'));
 app.get('/healthz', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 // ── Webhook ───────────────────────────────────────────────
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
-  try {
-    req.rawBody = req.body;
-    req.body = JSON.parse(req.body.toString('utf8'));
-  } catch (e) { return res.status(400).send('Bad JSON'); }
+  try { req.rawBody = req.body; req.body = JSON.parse(req.body.toString('utf8')); }
+  catch (e) { return res.status(400).send('Bad JSON'); }
   next();
 }, async (req, res) => {
   const sig = req.headers['x-line-signature'];
@@ -109,7 +112,8 @@ async function handleImage(event, userId, replyToken) {
   if (state.step === 'wait_pikmin') {
     state.pikmin = buf;
     state.step = 'wait_selfie';
-    await replyMsg(replyToken, '✅ 收到皮克敏截圖！\n\n📸 現在請傳送你的照片～\n（自拍、人像、全身皆可）');
+    await replyMsg(replyToken,
+      '✅ 收到皮克敏截圖！\n\n📸 現在請傳送你的照片～\n（自拍、人像、合照皆可）');
     return;
   }
 
@@ -129,8 +133,9 @@ async function handleImage(event, userId, replyToken) {
 
 // ── 生成主流程 ────────────────────────────────────────────
 async function generateAndSend(userId, state) {
-  const pikBuf  = await resizeImage(state.pikmin, 1024);
-  const selfBuf = await resizeImage(state.selfie, 1024);
+  // 給 Gemini 用較高解析度（提升融合品質）
+  const pikBuf  = await resizeImage(state.pikmin, 1280);
+  const selfBuf = await resizeImage(state.selfie, 1280);
   console.log('[GEN] 壓縮完成');
 
   let resultBase64;
@@ -153,7 +158,9 @@ async function generateAndSend(userId, state) {
   resetState(userId);
 }
 
-// ── Gemini 生成（強化版 prompt）──────────────────────────
+// ═══════════════════════════════════════════════════════════
+// ── Gemini 生成（v7 精準 prompt，對標 Image2）────────────
+// ═══════════════════════════════════════════════════════════
 async function geminiGenerateImage(pikBuf, selfBuf) {
   const genAI = new GoogleGenerativeAI(getGemini());
   const MODELS = [
@@ -161,38 +168,41 @@ async function geminiGenerateImage(pikBuf, selfBuf) {
     'gemini-2.0-flash-exp-image-generation',
   ];
 
-  // 強化版 prompt：人物主體、去背融入、只用截圖中有的角色
-  const prompt = `You are given exactly two images.
+  // ▼▼▼ 針對 Image2 效果精準設計的 prompt ▼▼▼
+  const prompt = `You will receive TWO images. Your job is to create ONE final composite photo.
 
-IMAGE 1 = Pikmin game screenshot (contains only specific Pikmin characters shown in this screenshot)
-IMAGE 2 = A person's photo (this person is the MAIN SUBJECT)
+=== IMAGE 1 === Pikmin characters source (game screenshot)
+=== IMAGE 2 === Real photo with people (THE MAIN PHOTO — keep everything intact)
 
-TASK: Generate ONE realistic composite photo with these strict rules:
+━━━ STRICT RULES ━━━
 
-PERSON (IMAGE 2):
-- The person is the MAIN SUBJECT and must occupy the majority of the frame
-- Keep the person's appearance, face, clothing, and pose EXACTLY unchanged
-- Do NOT alter, zoom, or crop the person
+【PEOPLE in IMAGE 2】
+• Every person must remain EXACTLY as-is: face, clothes, body, position, expression
+• Do NOT move, resize, crop, or alter any person
+• The background scene from IMAGE 2 must be preserved completely
 
-PIKMIN CHARACTERS (IMAGE 1):
-- Extract ONLY the Pikmin characters that actually appear in IMAGE 1
-- Do NOT add any Pikmin colors or types not present in IMAGE 1
-- Remove all game UI, backgrounds, and non-Pikmin elements from IMAGE 1
-- Place the Pikmin naturally around the person as if they are real companions:
-  * 1–2 Pikmin standing near the person's feet on the ground
-  * 1 Pikmin sitting or climbing on the person's shoulder
-  * 1 Pikmin peeking from behind or beside the person
-  * Optional: 1 Pikmin doing a fun pose (jumping, waving) nearby
-- Each Pikmin should face toward the person or look at the camera
-- Pikmin size should be proportionally correct (they are small creatures)
+【PIKMIN CHARACTERS from IMAGE 1】
+• Identify each distinct Pikmin character in IMAGE 1 (by color: red, blue, yellow, etc.)
+• Use ONLY the exact Pikmin types visible in IMAGE 1 — do NOT invent new ones
+• REMOVE all game backgrounds, UI elements, sky, ground textures from IMAGE 1
+• Extract each Pikmin as a standalone character with TRANSPARENT background
 
-PHOTO QUALITY:
-- Result must look like a REAL photograph, NOT a digital collage
-- Match the lighting, shadows, and color tone of IMAGE 2
-- Pikmin should cast small natural shadows on the ground
-- Seamless edges — no visible cutout or pasting artifacts
-- Same background as IMAGE 2 (do not change the background)
-- Warm, joyful, natural atmosphere`;
+【HOW TO PLACE PIKMIN — copy this style】
+Think of the result like a real AR photo where Pikmin physically exist in the scene:
+• Place 1 Pikmin jumping or climbing UP along someone's raised arm or hand (like riding the arm)
+• Place 1–2 Pikmin standing on the ground beside/between the people, at ankle-to-knee height
+• Place 1 Pikmin peeking from behind someone's shoulder or bag
+• Optional: 1 small Pikmin sitting on top of someone's head or hat
+• Pikmin should appear at DIFFERENT depths (some closer = larger, some farther = smaller)
+• Pikmin near the camera foreground should be 15–20% of frame height
+• Pikmin in mid-ground should be 10–13% of frame height
+
+【REALISM & BLENDING】
+• Pikmin must cast soft ground shadows matching the scene's light direction
+• Match color temperature: if photo is warm/cool, tint Pikmin accordingly
+• Pikmin edges must be soft and anti-aliased — zero hard cutout edges
+• Result must look like a real smartphone AR photo, NOT a collage
+• Preserve the full aspect ratio and resolution of IMAGE 2`;
 
   let lastErr = null;
   for (const modelName of MODELS) {
@@ -204,7 +214,9 @@ PHOTO QUALITY:
       });
       const result = await model.generateContent([
         { text: prompt },
+        // IMAGE 1 先傳皮克敏截圖
         { inlineData: { data: pikBuf.toString('base64'),  mimeType: 'image/jpeg' } },
+        // IMAGE 2 後傳人物照片
         { inlineData: { data: selfBuf.toString('base64'), mimeType: 'image/jpeg' } },
       ]);
       const parts = result.response.candidates?.[0]?.content?.parts || [];
@@ -223,100 +235,150 @@ PHOTO QUALITY:
   throw lastErr || new Error('所有模型均失敗');
 }
 
-// ── Sharp 合成（v6 完整重寫：人物主體 + 多點隨機擺放）────
+// ═══════════════════════════════════════════════════════════
+// ── Sharp 合成 Fallback（v7：亮度去背 + 自然融合）────────
+// ═══════════════════════════════════════════════════════════
 async function sharpComposite(selfieBuffer, pikminBuffer) {
-  // ① 人物底圖標準化：以人物為主體，統一 1024px 寬
+  // ① 人物底圖標準化
   const selfieBase = await sharp(selfieBuffer)
-    .resize({ width: 1024, withoutEnlargement: true })
-    .jpeg({ quality: 92 })
+    .resize({ width: 1080, withoutEnlargement: true })
+    .jpeg({ quality: 93 })
     .toBuffer();
 
   const { width: W, height: H } = await sharp(selfieBase).metadata();
-  console.log('[COMPOSITE] 人物底圖: ' + W + 'x' + H);
+  console.log('[COMPOSITE] 底圖: ' + W + 'x' + H);
 
-  // ② 皮克敏截圖：切割成左、中、右三塊（模擬多個不同角色）
-  //    實際上是把整張截圖縮小後，在不同位置各放一個（大小略有差異增加層次）
-  const pikminFull = await sharp(pikminBuffer)
-    .resize({ width: 800, withoutEnlargement: true })
-    .png()
-    .toBuffer();
+  // ② 分析皮克敏截圖的背景顏色（取四個角落平均色 → 作為去背基準）
+  const pikRaw = await sharp(pikminBuffer)
+    .resize({ width: 600, withoutEnlargement: true })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-  const pikMeta = await sharp(pikminFull).metadata();
-  const pikW = pikMeta.width;
-  const pikH = pikMeta.height;
+  const { data: rawData, info: rawInfo } = pikRaw;
+  const pikW = rawInfo.width;
+  const pikH = rawInfo.height;
+  const channels = rawInfo.channels; // 4 = RGBA
 
-  // 把截圖切成三個區塊，代表不同皮克敏角色位置
-  // 左1/3、中1/3、右1/3 — 這樣能取到截圖中不同位置的角色
+  // 取四個角落 10x10 像素的平均色 → 推斷背景色
+  function getCornerAvg(cx, cy, r) {
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
+    for (let dy = 0; dy < r; dy++) {
+      for (let dx = 0; dx < r; dx++) {
+        const x = Math.min(cx + dx, pikW - 1);
+        const y = Math.min(cy + dy, pikH - 1);
+        const idx = (y * pikW + x) * channels;
+        rSum += rawData[idx]; gSum += rawData[idx+1]; bSum += rawData[idx+2];
+        count++;
+      }
+    }
+    return { r: rSum/count, g: gSum/count, b: bSum/count };
+  }
+
+  const corners = [
+    getCornerAvg(0, 0, 10),
+    getCornerAvg(pikW - 10, 0, 10),
+    getCornerAvg(0, pikH - 10, 10),
+    getCornerAvg(pikW - 10, pikH - 10, 10),
+  ];
+  const bgR = corners.reduce((s,c)=>s+c.r,0)/4;
+  const bgG = corners.reduce((s,c)=>s+c.g,0)/4;
+  const bgB = corners.reduce((s,c)=>s+c.b,0)/4;
+  console.log('[COMPOSITE] 推斷背景色: rgb(' +
+    Math.round(bgR) + ',' + Math.round(bgG) + ',' + Math.round(bgB) + ')');
+
+  // ③ 對每個像素：計算與背景色的距離，距離小 → 透明，距離大 → 不透明
+  const threshold = 80; // 顏色差距閾值（可調整）
+  const edgeSoftness = 40; // 邊緣軟化範圍
+
+  const newData = Buffer.alloc(rawData.length);
+  for (let i = 0; i < rawData.length; i += channels) {
+    const pr = rawData[i], pg = rawData[i+1], pb = rawData[i+2];
+    const dist = Math.sqrt(
+      Math.pow(pr - bgR, 2) + Math.pow(pg - bgG, 2) + Math.pow(pb - bgB, 2)
+    );
+    newData[i]   = pr;
+    newData[i+1] = pg;
+    newData[i+2] = pb;
+    // 距離 < threshold → 完全透明；距離 > threshold+edgeSoftness → 完全不透明；中間漸變
+    const alpha = Math.max(0, Math.min(255,
+      Math.round((dist - threshold) / edgeSoftness * 255)
+    ));
+    newData[i+3] = alpha;
+  }
+
+  // ④ 重建去背後的皮克敏 PNG
+  const pikRemoved = await sharp(newData, {
+    raw: { width: pikW, height: pikH, channels: 4 }
+  }).png().toBuffer();
+
+  // ⑤ 把去背結果裁切成 3 份，各自縮放後放到自然位置
   const sliceW = Math.floor(pikW / 3);
 
-  async function extractSlice(left, size, outputSize) {
-    return sharp(pikminFull)
-      .extract({ left, top: 0, width: Math.min(sliceW, pikW - left), height: pikH })
-      .resize(size, size, { fit: 'inside', withoutEnlargement: true, background: { r:0,g:0,b:0,alpha:0 } })
-      .ensureAlpha()
+  async function makeChar(sliceLeft, targetSize) {
+    const w = Math.min(sliceW, pikW - sliceLeft);
+    return sharp(pikRemoved)
+      .extract({ left: sliceLeft, top: 0, width: w, height: pikH })
+      .resize(targetSize, targetSize, {
+        fit: 'inside',
+        withoutEnlargement: true,
+        background: { r:0, g:0, b:0, alpha:0 }
+      })
       .png()
       .toBuffer();
   }
 
-  // 各角色尺寸（腳邊稍大，肩膀偏小，增加遠近感）
-  const sizeGround = Math.floor(W * 0.20); // 腳邊站立：底圖寬 20%
-  const sizeShoulder = Math.floor(W * 0.13); // 肩膀：底圖寬 13%
-  const sizePeek = Math.floor(W * 0.16); // 側邊：底圖寬 16%
+  const sizeL = Math.floor(W * 0.19);  // 前景較大
+  const sizeM = Math.floor(W * 0.13);  // 肩膀小
+  const sizeR = Math.floor(W * 0.16);  // 中景
 
-  // 從截圖三個區塊各取一個角色
-  const [charLeft, charMid, charRight] = await Promise.all([
-    extractSlice(0,              sizeGround,   sizeGround),
-    extractSlice(sliceW,         sizeShoulder, sizeShoulder),
-    extractSlice(sliceW * 2,     sizePeek,     sizePeek),
+  const [charL, charM, charR] = await Promise.all([
+    makeChar(0,         sizeL),
+    makeChar(sliceW,    sizeM),
+    makeChar(sliceW*2,  sizeR),
   ]);
 
-  // 取得各角色實際尺寸
   const [mL, mM, mR] = await Promise.all([
-    sharp(charLeft).metadata(),
-    sharp(charMid).metadata(),
-    sharp(charRight).metadata(),
+    sharp(charL).metadata(),
+    sharp(charM).metadata(),
+    sharp(charR).metadata(),
   ]);
 
-  // ③ 決定擺放位置（以人物尺寸為基準，確保不超出邊界）
-  // 隨機微偏移讓每次結果略有不同
-  function randOffset(range) { return Math.floor((Math.random() - 0.5) * range); }
+  // ⑥ 計算擺放位置：以人物照片尺寸為基準，邊界安全
+  function safe(val, maxVal) { return Math.max(0, Math.min(maxVal, Math.round(val))); }
+  function rand(range) { return Math.floor((Math.random() - 0.5) * range); }
 
-  const positions = [
-    // 左腳邊站立
+  const layers = [
+    // 左前景：靠近相機的人腳邊，偏前偏低
     {
-      input: charLeft,
-      left: Math.max(0, Math.min(W - mL.width,  Math.floor(W * 0.08) + randOffset(40))),
-      top:  Math.max(0, Math.min(H - mL.height, Math.floor(H * 0.78) + randOffset(30))),
-      blend: 'over',
+      input: charL, blend: 'over',
+      left: safe(W * 0.05 + rand(50), W - mL.width),
+      top:  safe(H * 0.72 + rand(40), H - mL.height),
     },
-    // 右腳邊站立（略遠）
+    // 右中景：另一人腳邊
     {
-      input: charRight,
-      left: Math.max(0, Math.min(W - mR.width,  Math.floor(W * 0.68) + randOffset(40))),
-      top:  Math.max(0, Math.min(H - mR.height, Math.floor(H * 0.76) + randOffset(30))),
-      blend: 'over',
+      input: charR, blend: 'over',
+      left: safe(W * 0.65 + rand(50), W - mR.width),
+      top:  safe(H * 0.70 + rand(40), H - mR.height),
     },
-    // 肩膀位置（左肩，偏高偏中）
+    // 肩膀：左側人物肩膀高度
     {
-      input: charMid,
-      left: Math.max(0, Math.min(W - mM.width,  Math.floor(W * 0.22) + randOffset(30))),
-      top:  Math.max(0, Math.min(H - mM.height, Math.floor(H * 0.25) + randOffset(25))),
-      blend: 'over',
+      input: charM, blend: 'over',
+      left: safe(W * 0.20 + rand(40), W - mM.width),
+      top:  safe(H * 0.22 + rand(30), H - mM.height),
     },
   ];
 
-  // 日誌確認每個位置安全
-  positions.forEach((p, i) => {
-    console.log('[COMPOSITE] 角色' + (i+1) + ': left=' + p.left + ' top=' + p.top);
-  });
+  layers.forEach((l, i) =>
+    console.log('[COMPOSITE] 角色' + (i+1) + ': ' + l.left + 'x' + l.top)
+  );
 
-  // ④ 合成：人物底圖 + 所有皮克敏層
   const result = await sharp(selfieBase)
-    .composite(positions)
+    .composite(layers)
     .jpeg({ quality: 93 })
     .toBuffer();
 
-  console.log('[COMPOSITE] 完成, size=' + result.length);
+  console.log('[COMPOSITE] 完成 ' + result.length + ' bytes');
   return result;
 }
 
@@ -324,7 +386,7 @@ async function sharpComposite(selfieBuffer, pikminBuffer) {
 async function resizeImage(buffer, maxWidth) {
   return sharp(buffer)
     .resize({ width: maxWidth, withoutEnlargement: true })
-    .jpeg({ quality: 85 })
+    .jpeg({ quality: 88 })
     .toBuffer();
 }
 
@@ -333,10 +395,10 @@ async function downloadLineImageWithRetry(messageId, maxRetries = 3) {
   const url = 'https://api-data.line.me/v2/bot/message/' + messageId + '/content';
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log('[DL] 嘗試第 ' + attempt + ' 次 token長度=' + getToken().length);
+      console.log('[DL] #' + attempt + ' tokenLen=' + getToken().length);
       const res = await axios({
         method: 'GET', url,
-        headers: { Authorization: 'Bearer ' + getToken(), 'User-Agent': 'pikmin-bot/6.0' },
+        headers: { Authorization: 'Bearer ' + getToken(), 'User-Agent': 'pikmin-bot/7.0' },
         responseType: 'arraybuffer',
         timeout: 20000,
         maxContentLength: 20 * 1024 * 1024,
@@ -346,7 +408,7 @@ async function downloadLineImageWithRetry(messageId, maxRetries = 3) {
       return Buffer.from(res.data);
     } catch (err) {
       const s = err.response ? err.response.status : 'N/A';
-      console.error('[DL] 第 ' + attempt + ' 次失敗: HTTP=' + s + ' ' + err.message);
+      console.error('[DL] #' + attempt + ' 失敗 HTTP=' + s + ' ' + err.message);
       if (attempt === maxRetries) throw err;
       await sleep(attempt * 1000);
     }
@@ -361,10 +423,10 @@ async function uploadToImgurWithRetry(base64Data, maxRetries = 3) {
         { image: base64Data, type: 'base64' },
         { headers: { Authorization: 'Client-ID ' + IMGUR_CLIENT_ID, 'Content-Type': 'application/json' }, timeout: 30000 }
       );
-      if (!res.data?.success) throw new Error('Imgur 失敗: ' + JSON.stringify(res.data));
+      if (!res.data?.success) throw new Error('Imgur: ' + JSON.stringify(res.data));
       return res.data.data.link.replace('http://', 'https://');
     } catch (err) {
-      console.error('[IMGUR] 第 ' + attempt + ' 次失敗:', err.message);
+      console.error('[IMGUR] #' + attempt + ' 失敗:', err.message);
       if (attempt === maxRetries) throw err;
       await sleep(attempt * 1500);
     }
@@ -373,39 +435,54 @@ async function uploadToImgurWithRetry(base64Data, maxRetries = 3) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── LINE 訊息工具 ─────────────────────────────────────────
+// ── LINE 工具 ─────────────────────────────────────────────
 async function replyMsg(replyToken, text) {
   try { await getClient().replyMessage({ replyToken, messages: [{ type: 'text', text }] }); }
-  catch (err) { console.error('[REPLY]', err.message); }
+  catch (e) { console.error('[REPLY]', e.message); }
 }
 async function pushMsg(userId, text) {
   try { await getClient().pushMessage({ to: userId, messages: [{ type: 'text', text }] }); }
-  catch (err) { console.error('[PUSH]', err.message); }
+  catch (e) { console.error('[PUSH]', e.message); }
 }
 async function pushImg(userId, imageUrl) {
   try {
     await getClient().pushMessage({ to: userId, messages: [{
       type: 'image', originalContentUrl: imageUrl, previewImageUrl: imageUrl,
     }]});
-  } catch (err) { console.error('[PUSH IMG]', err.message); }
+  } catch (e) { console.error('[PUSH IMG]', e.message); }
 }
 
 function getGuideText(step) {
-  return {
-    wait_pikmin: '👋 歡迎使用皮克敏合照機器人！\n\n步驟：\n1️⃣ 傳送皮克敏遊戲截圖\n   （截圖中有哪些皮克敏，合照就放哪些）\n2️⃣ 傳送你的照片\n   （自拍、人像、全身皆可）\n3️⃣ 等待 AI 生成合照 ✨\n\n➡️ 請先傳送皮克敏截圖！',
-    wait_selfie: '✅ 收到皮克敏截圖！\n\n➡️ 請傳送你的照片 📸\n（自拍、人像、全身皆可）',
-    generating:  '⏳ 正在生成合照中，請稍候...',
-  }[step] || '➡️ 請傳送皮克敏截圖！';
+  return ({
+    wait_pikmin:
+      '👋 歡迎使用皮克敏合照機器人！\n\n' +
+      '📋 步驟：\n' +
+      '1️⃣ 傳送皮克敏遊戲截圖\n' +
+      '   截圖中有哪些皮克敏，合照就放哪些 🌿\n' +
+      '2️⃣ 傳送你的照片\n' +
+      '   自拍、人像、多人合照皆可 📸\n' +
+      '3️⃣ AI 自動生成合照 ✨\n\n' +
+      '➡️ 請先傳送皮克敏截圖！',
+    wait_selfie:
+      '✅ 收到皮克敏截圖！\n\n' +
+      '➡️ 請傳送你的照片 📸\n' +
+      '（自拍、人像、合照皆可）',
+    generating: '⏳ 正在生成合照中，請稍候...',
+  })[step] || '➡️ 請傳送皮克敏截圖！';
 }
 
 // ── 啟動 ──────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('\n🌿 皮克敏合照 Bot v6 啟動！Port=' + PORT);
-  const checks = { LINE_CHANNEL_ACCESS_TOKEN: getToken(), LINE_CHANNEL_SECRET: getSecret(), GEMINI_API_KEY: getGemini() };
+  console.log('\n🌿 皮克敏合照 Bot v7 啟動！Port=' + PORT);
+  const checks = {
+    LINE_CHANNEL_ACCESS_TOKEN: getToken(),
+    LINE_CHANNEL_SECRET:       getSecret(),
+    GEMINI_API_KEY:            getGemini(),
+  };
   let allOk = true;
   for (const [k, v] of Object.entries(checks)) {
     if (!v) { console.error('❌ 缺少: ' + k); allOk = false; }
-    else console.log('✅ ' + k + ' (長度=' + v.length + ')');
+    else     console.log('✅ ' + k + ' (長度=' + v.length + ')');
   }
   console.log(allOk ? '\n🚀 全部就緒！\n' : '\n⚠️ 請補上缺少的環境變數！\n');
 });
