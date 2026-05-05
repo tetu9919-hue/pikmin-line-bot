@@ -1,18 +1,18 @@
 {
   "name": "pikmin-line-bot",
   "version": "1.0.0",
-  "description": "皮克敏合照 LINE Bot",
+  "description": "皮克敏合照 LINE Bot v9",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
     "dev": "node --watch bot.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@line/bot-sdk": "^9.3.0",
-    "@google/generative-ai": "^0.21.0",
-    "express": "^4.19.2",
     "axios": "^1.7.2",
-    "sharp": "^0.33.4",
-    "form-data": "^4.0.0"
+    "express": "^4.19.2",
+    "form-data": "^4.0.0",
+    "sharp": "^0.33.4"
   }
 }
