@@ -224,20 +224,40 @@ Create a composite photo:
 
 // ── Sharp 本地合成 Fallback ───────────────────────────────
 async function sharpComposite(selfieBuffer, pikminBuffer) {
-  const meta = await sharp(selfieBuffer).metadata();
-  const w = meta.width || 1024;
-  const pikSize = Math.round(w * 0.45);
+  // 先把自拍統一縮到 1024 寬，取得穩定的基準尺寸
+  const selfieBase = await sharp(selfieBuffer)
+    .resize({ width: 1024, withoutEnlargement: true })
+    .jpeg({ quality: 90 })
+    .toBuffer();
+
+  const meta = await sharp(selfieBase).metadata();
+  const baseW = meta.width  || 1024;
+  const baseH = meta.height || 1024;
+
+  // 皮克敏覆蓋圖：寬度最多 45%，高度最多 45%，嚴格不超出
+  const maxOverlayW = Math.floor(baseW * 0.45);
+  const maxOverlayH = Math.floor(baseH * 0.45);
 
   const pikPng = await sharp(pikminBuffer)
-    .resize(pikSize, Math.round(pikSize * 1.2), {
-      fit: 'contain',
+    .resize(maxOverlayW, maxOverlayH, {
+      fit: 'inside',            // ✅ inside = 寬高都不超過指定值
+      withoutEnlargement: true, // ✅ 不放大小圖
       background: { r: 0, g: 0, b: 0, alpha: 0 },
     })
     .png()
     .toBuffer();
 
-  return sharp(selfieBuffer)
-    .composite([{ input: pikPng, gravity: 'southeast', blend: 'over' }])
+  // 確認覆蓋圖尺寸真的小於底圖（防禦性檢查）
+  const pikMeta = await sharp(pikPng).metadata();
+  console.log('[COMPOSITE] selfie=' + baseW + 'x' + baseH +
+    ' overlay=' + pikMeta.width + 'x' + pikMeta.height);
+
+  return sharp(selfieBase)
+    .composite([{
+      input: pikPng,
+      gravity: 'southeast',  // 右下角
+      blend: 'over',
+    }])
     .jpeg({ quality: 92 })
     .toBuffer();
 }
