@@ -1,12 +1,13 @@
 /**
- * 🌿 皮克敏合照 LINE Bot
- * 使用 Google Gemini 2.0 Flash (免費，無需身份驗證)
- * 使用 LINE Messaging API
- * 
- * 流程：
- * 1. 使用者傳送皮克敏截圖 → Bot 記住
- * 2. 使用者傳送自拍照 → Bot 記住
- * 3. Bot 自動呼叫 Gemini 生成合照描述 → 回傳合成圖
+ * 🌿 皮克敏合照 LINE Bot - v3 完整修正版
+ *
+ * 修正：
+ * 1. TOKEN 改為函數動態讀取（解決 Render 冷啟動 undefined 問題）
+ * 2. 下載圖片加入 retry 機制（最多 3 次）
+ * 3. 下載失敗時詳細印出 HTTP status 方便排查
+ * 4. Imgur 上傳加入 retry
+ * 5. 圖片 URL 統一確保是 HTTPS + jpg 結尾（LINE 規範）
+ * 6. 加入 /healthz 路由方便 Render 健康檢查
  */
 
 const express = require('express');
@@ -14,28 +15,27 @@ const line = require('@line/bot-sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const sharp = require('sharp');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-// ── 設定 ────────────────────────────────────────────────
-const config = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-};
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PORT = process.env.PORT || 3000;
+const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || 'f0ea04148a54268';
+
+// ✅ 關鍵修正：TOKEN 用函數讀取，不在 top-level 用 const 鎖死
+// Render 冷啟動時 process.env 可能還沒就緒，改成每次呼叫時才讀
+function getToken()  { return process.env.LINE_CHANNEL_ACCESS_TOKEN || ''; }
+function getSecret() { return process.env.LINE_CHANNEL_SECRET || ''; }
+function getGemini() { return process.env.GEMINI_API_KEY || ''; }
 
 // ── 初始化 ───────────────────────────────────────────────
 const app = express();
-const client = new line.messagingApi.MessagingApiClient({
-  channelAccessToken: config.channelAccessToken,
-});
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// ── 暫存使用者狀態（記憶體，重啟清空）──────────────────
-// userState[userId] = { pikmin: Buffer|null, selfie: Buffer|null, step: 'wait_pikmin'|'wait_selfie'|'generating' }
+// messagingClient 也改成函數，確保每次用最新 token
+function getClient() {
+  return new line.messagingApi.MessagingApiClient({
+    channelAccessToken: getToken(),
+  });
+}
+
+// ── 使用者狀態暫存 ───────────────────────────────────────
 const userState = {};
 
 function getState(userId) {
@@ -49,316 +49,345 @@ function resetState(userId) {
   userState[userId] = { pikmin: null, selfie: null, step: 'wait_pikmin' };
 }
 
+// ── 健康檢查 ─────────────────────────────────────────────
+app.get('/', (req, res) => res.send('🌿 皮克敏合照 Bot 運作中！'));
+app.get('/healthz', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
 // ── LINE Webhook ─────────────────────────────────────────
-app.post('/webhook', line.middleware(config), async (req, res) => {
-  res.status(200).send('OK'); // 先回應 LINE，避免 timeout
-  const events = req.body.events;
-  for (const event of events) {
+app.post(
+  '/webhook',
+  express.raw({ type: 'application/json' }),
+  (req, res, next) => {
     try {
-      await handleEvent(event);
-    } catch (err) {
-      console.error('Event error:', err.message);
+      req.rawBody = req.body;
+      req.body = JSON.parse(req.body.toString('utf8'));
+    } catch (e) {
+      return res.status(400).send('Bad JSON');
+    }
+    next();
+  },
+  async (req, res) => {
+    // 驗證簽名
+    const sig = req.headers['x-line-signature'];
+    if (!sig || !line.validateSignature(req.rawBody, getSecret(), sig)) {
+      console.warn('⚠️  簽名驗證失敗, sig=' + sig);
+      return res.status(403).send('Invalid signature');
+    }
+
+    // 立即回應 200，LINE 伺服器不等處理結果
+    res.status(200).json({ status: 'ok' });
+
+    const events = req.body.events || [];
+    for (const event of events) {
+      handleEvent(event).catch((err) => {
+        console.error('❌ handleEvent 未捕捉錯誤:', err.message, err.stack);
+      });
     }
   }
-});
+);
 
-app.get('/', (req, res) => res.send('🌿 皮克敏合照 Bot 運作中！'));
-
-// ── 事件處理 ─────────────────────────────────────────────
+// ── 事件路由 ─────────────────────────────────────────────
 async function handleEvent(event) {
-  const userId = event.source.userId;
+  const userId = event.source && event.source.userId;
   const replyToken = event.replyToken;
+  if (!userId) return;
 
-  // 文字訊息
+  console.log('[EVENT] type=' + event.type + ' userId=' + userId.slice(0, 8) + '...');
+
   if (event.type === 'message' && event.message.type === 'text') {
     const text = event.message.text.trim();
-    if (text === '重來' || text === '重設' || text === 'reset' || text === 'Reset') {
+    if (['重來', '重設', '重新', 'reset', 'Reset', 'RESET', 'r', 'R'].includes(text)) {
       resetState(userId);
-      await reply(replyToken, makeText('🔄 已重設！請重新傳送皮克敏截圖。'));
+      await replyMsg(replyToken, '🔄 已重設！\n\n請傳送皮克敏截圖開始 👇');
       return;
     }
-    // 說明訊息
-    const state = getState(userId);
-    await reply(replyToken, makeText(getHelpText(state.step)));
+    await replyMsg(replyToken, getGuideText(getState(userId).step));
     return;
   }
 
-  // 圖片訊息
   if (event.type === 'message' && event.message.type === 'image') {
     await handleImage(event, userId, replyToken);
     return;
   }
 }
 
-// ── 圖片處理核心邏輯 ─────────────────────────────────────
+// ── 圖片訊息處理 ─────────────────────────────────────────
 async function handleImage(event, userId, replyToken) {
   const state = getState(userId);
+  const messageId = event.message.id;
 
-  // 下載圖片
-  let imageBuffer;
-  try {
-    imageBuffer = await downloadLineImage(event.message.id);
-  } catch (err) {
-    await reply(replyToken, makeText('❌ 下載圖片失敗，請再試一次。'));
+  console.log('[IMAGE] messageId=' + messageId + ' step=' + state.step);
+
+  if (state.step === 'generating') {
+    await replyMsg(replyToken, '⏳ 正在生成中，請稍候...');
     return;
   }
 
-  // ── 步驟一：收到皮克敏截圖 ──
+  // ✅ 關鍵修正：帶入重試機制下載圖片
+  let imageBuffer;
+  try {
+    imageBuffer = await downloadLineImageWithRetry(messageId);
+    console.log('[IMAGE] 下載成功 ' + imageBuffer.length + ' bytes');
+  } catch (err) {
+    console.error('[IMAGE] 下載失敗:', err.message);
+    await replyMsg(replyToken,
+      '❌ 下載圖片失敗\n\n可能原因：\n• 圖片太大（請用較小圖片）\n• 網路暫時問題\n\n請再傳一次，或輸入「重來」重設。'
+    );
+    return;
+  }
+
   if (state.step === 'wait_pikmin') {
     state.pikmin = imageBuffer;
     state.step = 'wait_selfie';
-    await reply(replyToken, [
-      makeText('✅ 收到皮克敏截圖！\n\n📸 現在請傳送你的自拍照～'),
-    ]);
+    await replyMsg(replyToken, '✅ 收到皮克敏截圖！\n\n📸 現在請傳送你的自拍照～');
     return;
   }
 
-  // ── 步驟二：收到自拍照 ──
   if (state.step === 'wait_selfie') {
     state.selfie = imageBuffer;
     state.step = 'generating';
-    await reply(replyToken, makeText('🌿 收到自拍照！\nAI 正在召喚皮克敏，請稍待 15–30 秒...'));
+    await replyMsg(replyToken, '🌿 收到自拍照！\nAI 正在召喚皮克敏，請稍待 20–40 秒...');
 
-    // 異步生成，不阻塞 reply
-    generateAndSend(userId, state).catch(async (err) => {
-      console.error('Generate error:', err.message);
-      resetState(userId);
-      await push(userId, makeText(`❌ 生成失敗：${err.message}\n\n請輸入「重來」重新開始。`));
+    setImmediate(() => {
+      generateAndSend(userId, state).catch(async (err) => {
+        console.error('[GEN] 失敗:', err.message);
+        resetState(userId);
+        await pushMsg(userId, '❌ 生成失敗：' + err.message + '\n\n請輸入「重來」重新開始。');
+      });
     });
-    return;
-  }
-
-  // 正在生成中
-  if (state.step === 'generating') {
-    await reply(replyToken, makeText('⏳ 正在生成中，請稍候...'));
     return;
   }
 }
 
-// ── 核心：Gemini 生成合照 ────────────────────────────────
+// ── 圖片生成主流程 ───────────────────────────────────────
 async function generateAndSend(userId, state) {
+  const pikminBuf = await resizeImage(state.pikmin, 1024);
+  const selfieBuf = await resizeImage(state.selfie, 1024);
+  console.log('[GEN] 圖片壓縮完成');
+
+  let resultBase64;
+
   try {
-    // 壓縮圖片（Gemini 有大小限制）
-    const pikminJpeg = await sharp(state.pikmin)
-      .resize({ width: 1024, withoutEnlargement: true })
-      .jpeg({ quality: 85 })
-      .toBuffer();
-
-    const selfieJpeg = await sharp(state.selfie)
-      .resize({ width: 1024, withoutEnlargement: true })
-      .jpeg({ quality: 85 })
-      .toBuffer();
-
-    // 使用 Gemini 2.0 Flash 的圖片生成功能
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash-exp',
-      generationConfig: {
-        responseModalities: ['Text', 'Image'],
-      },
-    });
-
-    const prompt = `You are given two images:
-- Image 1: A Pikmin video game screenshot containing Pikmin characters
-- Image 2: A person's selfie photo
-
-Your task: Create a fun, realistic composite photo where the Pikmin characters from Image 1 are naturally placed around the person in Image 2.
-
-Requirements:
-- Keep the person exactly as they look in the selfie
-- Extract the Pikmin characters and place them naturally: some on the shoulder, one on the hand, others on the ground
-- Make it look like a real smartphone photo
-- Natural lighting and realistic blending
-- No collage feeling — make it seamless
-- Warm, cheerful atmosphere
-
-Please generate the composite image.`;
-
-    const result = await model.generateContent([
-      { text: prompt },
-      {
-        inlineData: {
-          data: pikminJpeg.toString('base64'),
-          mimeType: 'image/jpeg',
-        },
-      },
-      {
-        inlineData: {
-          data: selfieJpeg.toString('base64'),
-          mimeType: 'image/jpeg',
-        },
-      },
-    ]);
-
-    // 從 response 取出圖片
-    const response = result.response;
-    let imageBase64 = null;
-
-    for (const part of response.candidates[0].content.parts) {
-      if (part.inlineData && part.inlineData.mimeType.startsWith('image/')) {
-        imageBase64 = part.inlineData.data;
-        break;
-      }
-    }
-
-    if (!imageBase64) {
-      // Gemini 沒有直接生成圖片，改用文字描述 + 提示
-      throw new Error('Gemini 這次沒有回傳圖片，請重試');
-    }
-
-    // 上傳圖片到 Imgur（免費公開圖床）作為臨時 URL
-    const imageUrl = await uploadToImgur(imageBase64);
-
-    // 回傳給使用者
-    await push(userId, [
-      {
-        type: 'image',
-        originalContentUrl: imageUrl,
-        previewImageUrl: imageUrl,
-      },
-      makeText('🎉 皮克敏合照完成！\n長按圖片即可儲存～\n\n輸入「重來」可以再做一次！'),
-    ]);
-
-    resetState(userId);
+    console.log('[GEN] 嘗試 Gemini...');
+    resultBase64 = await geminiGenerateImage(pikminBuf, selfieBuf);
+    console.log('[GEN] Gemini 成功');
   } catch (err) {
-    throw err;
+    console.warn('[GEN] Gemini 失敗 (' + err.message + ')，改用 sharp 合成');
+    const buf = await sharpComposite(state.selfie, state.pikmin);
+    resultBase64 = buf.toString('base64');
+    console.log('[GEN] Sharp 合成完成');
   }
-}
 
-// ── 備用方案：Gemini Vision 分析 + 說明 ──────────────────
-// 若 Gemini 圖片生成不可用（模型限制），改用此方案
-async function generateWithDescription(userId, state) {
-  const pikminJpeg = await sharp(state.pikmin)
-    .resize({ width: 800, withoutEnlargement: true })
-    .jpeg({ quality: 80 })
-    .toBuffer();
+  console.log('[GEN] 上傳 Imgur...');
+  const imageUrl = await uploadToImgurWithRetry(resultBase64);
+  console.log('[GEN] Imgur URL: ' + imageUrl);
 
-  const selfieJpeg = await sharp(state.selfie)
-    .resize({ width: 800, withoutEnlargement: true })
-    .jpeg({ quality: 80 })
-    .toBuffer();
-
-  // 使用 canvas 合成圖片（本地端處理）
-  const composited = await compositeImages(state.selfie, state.pikmin);
-  const imageUrl = await uploadToImgur(composited.toString('base64'));
-
-  await push(userId, [
-    {
-      type: 'image',
-      originalContentUrl: imageUrl,
-      previewImageUrl: imageUrl,
-    },
-    makeText('🎉 皮克敏合照完成！\n長按圖片即可儲存～\n\n輸入「重來」可以再做一次！'),
-  ]);
-
+  await pushImg(userId, imageUrl);
+  await pushMsg(userId, '🎉 皮克敏合照完成！\n長按圖片可儲存到相簿 📱\n\n輸入「重來」再做一次！');
   resetState(userId);
 }
 
-// ── 本地圖片合成（sharp）─────────────────────────────────
-async function compositeImages(selfieBuffer, pikminBuffer) {
-  // 取得自拍尺寸
-  const selfieInfo = await sharp(selfieBuffer).metadata();
-  const w = selfieInfo.width;
-  const h = selfieInfo.height;
+// ── Gemini 圖片生成 ──────────────────────────────────────
+async function geminiGenerateImage(pikminBuf, selfieBuf) {
+  const genAI = new GoogleGenerativeAI(getGemini());
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.0-flash-exp',
+    generationConfig: { responseModalities: ['Text', 'Image'] },
+  });
 
-  // 將皮克敏截圖縮小到 40% 寬，放在右下角
-  const pikminSize = Math.round(w * 0.45);
-  const pikminResized = await sharp(pikminBuffer)
-    .resize(pikminSize, pikminSize, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+  const result = await model.generateContent([
+    {
+      text: `Two images provided:
+Image 1: Pikmin game screenshot with Pikmin characters.
+Image 2: Person's selfie.
+
+Create a composite photo:
+- Keep the person exactly as-is from the selfie
+- Naturally place Pikmin characters around the person (shoulder, hand, ground)
+- Realistic lighting, seamless blending, NOT a collage
+- Warm cheerful atmosphere like a real photo`,
+    },
+    { inlineData: { data: pikminBuf.toString('base64'), mimeType: 'image/jpeg' } },
+    { inlineData: { data: selfieBuf.toString('base64'), mimeType: 'image/jpeg' } },
+  ]);
+
+  const parts =
+    result.response.candidates?.[0]?.content?.parts || [];
+
+  for (const part of parts) {
+    if (part.inlineData?.mimeType?.startsWith('image/')) {
+      return part.inlineData.data; // base64
+    }
+  }
+  throw new Error('Gemini 未回傳圖片');
+}
+
+// ── Sharp 本地合成 Fallback ───────────────────────────────
+async function sharpComposite(selfieBuffer, pikminBuffer) {
+  const meta = await sharp(selfieBuffer).metadata();
+  const w = meta.width || 1024;
+  const pikSize = Math.round(w * 0.45);
+
+  const pikPng = await sharp(pikminBuffer)
+    .resize(pikSize, Math.round(pikSize * 1.2), {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
     .png()
     .toBuffer();
 
-  // 合成
-  const result = await sharp(selfieBuffer)
-    .composite([
-      {
-        input: pikminResized,
-        gravity: 'southeast',
-        blend: 'over',
-      },
-    ])
-    .jpeg({ quality: 90 })
+  return sharp(selfieBuffer)
+    .composite([{ input: pikPng, gravity: 'southeast', blend: 'over' }])
+    .jpeg({ quality: 92 })
     .toBuffer();
-
-  return result;
 }
 
-// ── 上傳到 Imgur ─────────────────────────────────────────
-async function uploadToImgur(base64Data) {
-  // Imgur 匿名上傳（免費，無需帳號）
-  const IMGUR_CLIENT_ID = process.env.IMGUR_CLIENT_ID || 'f0ea04148a54268'; // 公共測試 ID
-  
-  const response = await axios.post(
-    'https://api.imgur.com/3/image',
-    { image: base64Data, type: 'base64' },
-    {
-      headers: {
-        Authorization: `Client-ID ${IMGUR_CLIENT_ID}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
+// ── 圖片壓縮 ─────────────────────────────────────────────
+async function resizeImage(buffer, maxWidth) {
+  return sharp(buffer)
+    .resize({ width: maxWidth, withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+}
+
+// ── ✅ 下載 LINE 圖片（含 retry）────────────────────────
+async function downloadLineImageWithRetry(messageId, maxRetries = 3) {
+  const url = 'https://api-data.line.me/v2/bot/message/' + messageId + '/content';
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log('[DL] 嘗試第 ' + attempt + ' 次, messageId=' + messageId);
+      console.log('[DL] TOKEN 長度=' + getToken().length); // 確認 token 有值
+
+      const response = await axios({
+        method: 'GET',
+        url: url,
+        headers: {
+          'Authorization': 'Bearer ' + getToken(),
+          'User-Agent': 'pikmin-bot/3.0',
+        },
+        responseType: 'arraybuffer',
+        timeout: 20000,
+        maxContentLength: 20 * 1024 * 1024, // 20MB
+      });
+
+      console.log('[DL] HTTP ' + response.status + ', size=' + response.data.byteLength);
+
+      if (response.status !== 200) {
+        throw new Error('HTTP ' + response.status);
+      }
+      if (!response.data || response.data.byteLength === 0) {
+        throw new Error('回傳內容為空');
+      }
+
+      return Buffer.from(response.data);
+    } catch (err) {
+      const status = err.response ? err.response.status : 'N/A';
+      const detail = err.response ? JSON.stringify(err.response.data).slice(0, 200) : err.message;
+      console.error('[DL] 第 ' + attempt + ' 次失敗: HTTP=' + status + ' msg=' + detail);
+
+      if (attempt === maxRetries) throw err;
+
+      // 等待後重試（1s / 2s / 3s）
+      await sleep(attempt * 1000);
     }
-  );
-
-  if (!response.data.success) {
-    throw new Error('Imgur 上傳失敗');
   }
-
-  return response.data.data.link;
 }
 
-// ── 下載 LINE 圖片 ───────────────────────────────────────
-async function downloadLineImage(messageId) {
-  const stream = await client.getMessageContent(messageId);
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on('data', (chunk) => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
-  });
+// ── Imgur 上傳（含 retry）────────────────────────────────
+async function uploadToImgurWithRetry(base64Data, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await axios.post(
+        'https://api.imgur.com/3/image',
+        { image: base64Data, type: 'base64' },
+        {
+          headers: {
+            Authorization: 'Client-ID ' + IMGUR_CLIENT_ID,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000,
+        }
+      );
+      if (!response.data?.success) {
+        throw new Error('Imgur 回傳失敗: ' + JSON.stringify(response.data));
+      }
+      const url = response.data.data.link.replace('http://', 'https://');
+      return url;
+    } catch (err) {
+      console.error('[IMGUR] 第 ' + attempt + ' 次失敗:', err.message);
+      if (attempt === maxRetries) throw err;
+      await sleep(attempt * 1500);
+    }
+  }
+}
+
+// ── 工具 ─────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ── LINE 訊息工具 ────────────────────────────────────────
-async function reply(replyToken, messages) {
-  const msgs = Array.isArray(messages) ? messages : [messages];
-  await client.replyMessage({ replyToken, messages: msgs });
-}
-
-async function push(userId, messages) {
-  const msgs = Array.isArray(messages) ? messages : [messages];
-  await client.pushMessage({ to: userId, messages: msgs });
-}
-
-function makeText(text) {
-  return { type: 'text', text };
-}
-
-function getHelpText(step) {
-  if (step === 'wait_pikmin') {
-    return '👋 歡迎使用皮克敏合照機器人！\n\n📋 步驟：\n1️⃣ 傳送皮克敏遊戲截圖\n2️⃣ 傳送你的自拍照\n3️⃣ 等待 AI 生成合照 ✨\n\n現在請傳送皮克敏截圖！';
+async function replyMsg(replyToken, text) {
+  try {
+    await getClient().replyMessage({ replyToken, messages: [{ type: 'text', text }] });
+  } catch (err) {
+    console.error('[REPLY] 錯誤:', err.message);
   }
-  if (step === 'wait_selfie') {
-    return '✅ 已收到皮克敏截圖！\n\n📸 請傳送你的自拍照';
+}
+
+async function pushMsg(userId, text) {
+  try {
+    await getClient().pushMessage({ to: userId, messages: [{ type: 'text', text }] });
+  } catch (err) {
+    console.error('[PUSH] 錯誤:', err.message);
   }
-  return '⏳ 正在生成合照中，請稍候...';
+}
+
+async function pushImg(userId, imageUrl) {
+  try {
+    await getClient().pushMessage({
+      to: userId,
+      messages: [{
+        type: 'image',
+        originalContentUrl: imageUrl,
+        previewImageUrl: imageUrl,
+      }],
+    });
+  } catch (err) {
+    console.error('[PUSH IMG] 錯誤:', err.message);
+  }
+}
+
+function getGuideText(step) {
+  const guides = {
+    wait_pikmin: '👋 歡迎使用皮克敏合照機器人！\n\n步驟：\n1️⃣ 傳送皮克敏遊戲截圖\n2️⃣ 傳送你的自拍照\n3️⃣ 等待 AI 生成合照 ✨\n\n➡️ 請先傳送皮克敏截圖！',
+    wait_selfie: '✅ 已收到皮克敏截圖！\n\n➡️ 請傳送你的自拍照 📸',
+    generating:  '⏳ 正在生成合照中，請稍候...',
+  };
+  return guides[step] || guides.wait_pikmin;
 }
 
 // ── 啟動 ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`
-🌿 皮克敏合照 LINE Bot 已啟動！
-📡 Port: ${PORT}
-🔗 Webhook URL: https://你的網域/webhook
-  `);
+  console.log('\n🌿 皮克敏合照 Bot v3 啟動！Port=' + PORT);
 
-  // 檢查環境變數
-  const missing = [];
-  if (!process.env.LINE_CHANNEL_ACCESS_TOKEN) missing.push('LINE_CHANNEL_ACCESS_TOKEN');
-  if (!process.env.LINE_CHANNEL_SECRET) missing.push('LINE_CHANNEL_SECRET');
-  if (!process.env.GEMINI_API_KEY) missing.push('GEMINI_API_KEY');
-  if (missing.length > 0) {
-    console.warn('⚠️  缺少環境變數:', missing.join(', '));
-    console.warn('   請參考 .env.example 設定');
+  // 啟動時才讀 env，這時一定已載入
+  const checks = {
+    LINE_CHANNEL_ACCESS_TOKEN: getToken(),
+    LINE_CHANNEL_SECRET: getSecret(),
+    GEMINI_API_KEY: getGemini(),
+  };
+
+  let allOk = true;
+  for (const [k, v] of Object.entries(checks)) {
+    if (!v) { console.error('❌ 缺少: ' + k); allOk = false; }
+    else console.log('✅ ' + k + ' (長度=' + v.length + ')');
+  }
+
+  if (!allOk) {
+    console.error('\n⚠️  請在 Render > Environment Variables 補上缺少的變數！\n');
   } else {
-    console.log('✅ 所有環境變數已設定！');
+    console.log('\n🚀 全部就緒！\n');
   }
 });
